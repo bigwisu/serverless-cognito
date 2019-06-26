@@ -3,16 +3,23 @@ service: cognito-user-pool
 provider:
   name: aws
   runtime: nodejs8.10
-  region: eu-west-2
+  region: ap-northeast-1
   stage: ${self:custom.currentStage}
   logRetentionInDays: 30
   timeout: 30
+
+plugins:
+  - serverless-stack-output
 
 custom:
   defaultStage: dev
   currentStage: ${opt:stage, self:custom.defaultStage}
   userPoolName: test-user-pool-${self:custom.currentStage}
   userPoolClientName: test-user-pool-client-${self:custom.currentStage}
+  identityPoolName: testUserPoolIdentity${self:custom.currentStage}
+  output:
+    handler: scripts/output.handler # Same syntax as you already know
+    file: stack.json # toml, yaml, yml, and json format is available
 
 functions:
   registeredOnly:
@@ -34,20 +41,55 @@ functions:
 
 resources:
   Resources:
+
+    # Creates a user pool in cognito for your app to auth against
+
+    # Fixme: customer email address needs to be manually entered and verified
+    # https://console.aws.amazon.com/ses/home?region=us-east-1#verified-senders-email:
+
+    # Time based MFA can not be enabled from script
+    # I have asked AWS to fix this
+
     CognitoUserPool:
       Type: "AWS::Cognito::UserPool"
       Properties:
-        MfaConfiguration: OFF
         UserPoolName: ${self:custom.userPoolName}
-        UsernameAttributes:
+        SmsVerificationMessage: "Your verification code is {####}."
+        AutoVerifiedAttributes:
           - email
+        MfaConfiguration: "OFF"
+        EmailVerificationSubject: "Your profile verification code"
+        EmailVerificationMessage: "Your profile verification code is {####}."
+        SmsAuthenticationMessage: "Your profile authentication code is {####}."
+        Schema:
+          - Name: name
+            AttributeDataType: String
+            Mutable: true
+            Required: false
+          - Name: email
+            AttributeDataType: String
+            Mutable: false
+            Required: true
+          - Name: phone_number
+            AttributeDataType: String
+            Mutable: true
+            Required: false
         Policies:
           PasswordPolicy:
             MinimumLength: 6
             RequireLowercase: False
             RequireNumbers: True
             RequireSymbols: False
-            RequireUppercase: True
+            RequireUppercase: False
+        AdminCreateUserConfig:
+          InviteMessageTemplate:
+            EmailMessage: "Your profile username is {username} and temporary password is {####}."
+            EmailSubject: "Your temporary profile password"
+            SMSMessage: "Your profile username is {username} and temporary password is {####}."
+          UnusedAccountValidityDays: 7
+          AllowAdminCreateUserOnly: False
+
+    # Creates a User Pool Client to be used by the identity pool
     CognitoUserPoolClient:
       Type: "AWS::Cognito::UserPoolClient"
       Properties:
@@ -55,6 +97,99 @@ resources:
         GenerateSecret: False
         UserPoolId:
           Ref: CognitoUserPool
+    
+    # Creates a federeated Identity pool
+    CognitoIdentityPool:
+      Type: "AWS::Cognito::IdentityPool"
+      Properties:
+        IdentityPoolName: ${self:custom.identityPoolName}
+        AllowUnauthenticatedIdentities: True
+        CognitoIdentityProviders: 
+          - ClientId: 
+              Ref: CognitoUserPoolClient
+            ProviderName:
+              'Fn::GetAtt': [ CognitoUserPool, ProviderName ]
+        SupportedLoginProviders:
+          'graph.facebook.com': "xxxxxxxxxx"
+        OpenIdConnectProviderARNs:
+          - 'arn:aws:iam::xxxxxxxxxxx:oidc-provider/accounts.google.com'
+
+    # Create a role for unauthorized acces to AWS resources. Very limited access. Only allows users in the previously created Identity Pool
+    CognitoUnAuthorizedRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        AssumeRolePolicyDocument: 
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal: 
+                Federated: "cognito-identity.amazonaws.com"
+              Action: 
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals: 
+                  "cognito-identity.amazonaws.com:aud":
+                    Ref: CognitoIdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": unauthenticated
+        Policies:
+          - PolicyName: "CognitoUnauthorizedPolicy"
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement: 
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                  Resource: "*"
+
+    # Create a role for authorized acces to AWS resources. Control what your user can access. This example only allows Lambda invokation
+    # Only allows users in the previously created Identity Pool
+    CognitoAuthorizedRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        AssumeRolePolicyDocument: 
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal: 
+                Federated: "cognito-identity.amazonaws.com"
+              Action: 
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals: 
+                  "cognito-identity.amazonaws.com:aud":
+                    Ref: CognitoIdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": authenticated
+        Policies:
+          - PolicyName: "CognitoAuthorizedPolicy"
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement: 
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                    - "cognito-identity:*"
+                  Resource: "*"
+                - Effect: "Allow"
+                  Action:
+                    - "lambda:InvokeFunction"
+                  Resource: "*"
+    
+    # Assigns the roles to the Identity Pool
+    IdentityPoolRoleMapping:
+      Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+      Properties:
+        IdentityPoolId: 
+          Ref: CognitoIdentityPool
+        Roles:
+          authenticated:
+              'Fn::GetAtt': [ CognitoAuthorizedRole, Arn ]
+          unauthenticated:
+              'Fn::GetAtt': [ CognitoUnAuthorizedRole, Arn ]
+
     ApiGatewayAuthorizer:
       DependsOn:
         - ApiGatewayRestApi
@@ -67,11 +202,20 @@ resources:
         Type: COGNITO_USER_POOLS
         ProviderARNs:
           - Fn::GetAtt: [CognitoUserPool, Arn]
+
   Outputs:
-    CognitoUserPoolArn:
-      Value:
-        Fn::GetAtt:
-          - CognitoUserPool
-          - Arn
+    CognitoUserPoolId:
+      Value: 
+        Ref: CognitoUserPool
       Export:
-        Name: CognitoUserPoolArn-${self:custom.currentStage}
+        Name: "UserPool::Id"
+    CognitoUserPoolClientId:
+      Value:
+        Ref: CognitoUserPoolClient
+      Export:
+        Name: "UserPoolClient::Id"
+    CognitoIdentityPoolId:
+      Value:
+        Ref: CognitoIdentityPool
+      Export:
+        Name: "IdentityPool::Id"
