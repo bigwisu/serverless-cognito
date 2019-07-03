@@ -19,14 +19,14 @@ custom:
   identityPoolName: testUserPoolIdentity${self:custom.currentStage}
   output:
     handler: scripts/output.handler # Same syntax as you already know
-    file: stack.json # toml, yaml, yml, and json format is available
+    file: stack.toml # toml, yaml, yml, and json format is available
 
 functions:
   registeredOnly:
     handler: handler.hiUsers
     events:
       - http:
-          path: /hiUsers
+          path: /hi-users
           method: get
           authorizer:
             type: COGNITO_USER_POOLS
@@ -36,7 +36,13 @@ functions:
     handler: handler.hiGuests
     events:
       - http:
-          path: /hiAll
+          path: /hi-all
+          method: get
+  presignup:
+    handler: handler.presignup
+    events:
+      - http:
+          path: /pre-signup
           method: get
 
 resources:
@@ -88,6 +94,9 @@ resources:
             SMSMessage: "Your profile username is {username} and temporary password is {####}."
           UnusedAccountValidityDays: 7
           AllowAdminCreateUserOnly: False
+        LambdaConfig:
+          PreSignUp: 
+            Fn::GetAtt: [ PresignupLambdaFunction, Arn ]
 
     # Creates a User Pool Client to be used by the identity pool
     CognitoUserPoolClient:
@@ -177,6 +186,19 @@ resources:
                   Action:
                     - "lambda:InvokeFunction"
                   Resource: "*"
+  
+    # Permission for CognitoUserPool to invoke PreSignup Lambda Function
+    CognitoPreSignupPermission:
+      Type: 'AWS::Lambda::Permission'
+      Properties:
+        Action: "lambda:InvokeFunction"
+        FunctionName:
+          Fn::GetAtt: [ "PresignupLambdaFunction", "Arn" ]
+        Principal: "cognito-idp.amazonaws.com"
+        SourceArn:
+          # TODO: check if using * on SourceArn like this is safe
+          # Fn::Join: [ "", [ "arn:aws:cognito-idp", ":", Ref: "AWS::Region", ":", Ref: "AWS::AccountId", ":", "userpool/", "@cognito_pool_id@" ] ]
+          Fn::Join: [ "", [ "arn:aws:cognito-idp", ":", Ref: "AWS::Region", ":", Ref: "AWS::AccountId", ":", "userpool/", "*" ] ]
     
     # Assigns the roles to the Identity Pool
     IdentityPoolRoleMapping:
@@ -201,7 +223,7 @@ resources:
           Ref: ApiGatewayRestApi
         Type: COGNITO_USER_POOLS
         ProviderARNs:
-          - Fn::GetAtt: [CognitoUserPool, Arn]
+          - Fn::GetAtt: [ CognitoUserPool, Arn ]
 
   Outputs:
     CognitoUserPoolId:
